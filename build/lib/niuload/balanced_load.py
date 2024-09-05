@@ -1,5 +1,4 @@
 import accelerate
-import torch
 from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM
 import math
 from torch.cuda import device_count
@@ -186,7 +185,6 @@ def balanced_load(
             layers_per_device[i] += 1
 
         print(layers_per_device)
-
         layers = {}
         if encoder_decoder:
 
@@ -228,12 +226,10 @@ def balanced_load(
                 temp_max_burden = burden
                 temp_max_idx = idx
         for keys in must_allocate_keys:
-            device_map[keys] = devices_idx[temp_max_idx]
+            device_map[keys] = temp_max_idx
             del params_ratio[keys]
         layers_per_device[temp_max_idx] -= must_allocate_burden
-        
-        # import pdb
-        # pdb.set_trace()
+            
 
         # 开始分配特殊层
         for layer_name, layer_burden in params_ratio.items():
@@ -246,9 +242,6 @@ def balanced_load(
                 current_device += 1
             device_map[layer_name] = devices_idx[current_device]
             layers_per_device[current_device] -= layer_burden
-
-        # import pdb
-        # pdb.set_trace()
 
  
         # 先分配普通层，因为他们数量很多，保证他们尽可能在一个device上会加快推理速度
@@ -274,10 +267,6 @@ def balanced_load(
                 model_type2lm_head_names[model.config.model_type]
             ]
 
-        # import pdb
-        # pdb.set_trace()
-
-        
         return device_map
 
     # 使用手动创建的 device_map
@@ -301,7 +290,7 @@ def balanced_load(
     if encoder_decoder:
         model = AutoModelForSeq2SeqLM.from_pretrained(
             model_dir,
-            torch_dtype=torch.float32,
+            torch_dtype="auto",
             device_map=device_map,
             low_cpu_mem_usage="True",
             trust_remote_code=True,
