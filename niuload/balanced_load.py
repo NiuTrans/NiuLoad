@@ -7,11 +7,17 @@ from torch.cuda import device_count
 model_type2lm_head_modules = {
     "fsmt": lambda model: model.model.decoder.output_projection,
     "llama": lambda model: model.lm_head,
+    "gemma":lambda model: model.lm_head,
+    "qwen2":lambda model: model.lm_head,
+    "mistral":lambda model: model.lm_head,
 }
 
 model_type2lm_head_names = {
     "fsmt": "model.decoder.output_projection",
     "llama": "lm_head",
+    "gemma":"lm_head",
+    "qwen2":"lm_head",
+    "mistral":"lm_head",
 }
 
 # layers_must_be_placed_together=[(*.embed_positions)]
@@ -131,7 +137,7 @@ def balanced_load(
         # ratio_rotary_emb = (
         #     round(rotary_emb_params / layer_params) if rotary_emb_params > 0 else 0
         # )
-
+        
         total_layers = 0
         if encoder_decoder:
             if encoder_layer_params < decoder_layer_params:
@@ -170,9 +176,15 @@ def balanced_load(
         remainder = total_layers - sum(layers_per_device)
 
         # 从后面开始分配剩余层
+        start_index=num_devices-1
+        while remainder!=0:
+            layers_per_device[start_index]+=1
+            remainder-=1
+            start_index=start_index-1%num_devices
         for i in range(remainder - 1, -1, -1):
             layers_per_device[i] += 1
 
+        print(layers_per_device)
         layers = {}
         if encoder_decoder:
 
@@ -194,6 +206,8 @@ def balanced_load(
             for i in range(model.config.num_hidden_layers):
                 layers[f"model.layers.{i}"] = 1
 
+
+        
         # 位置编码和输入层必须放在一起，不然会马上报错
         must_allocate_burden = 0
         must_allocate_keys = []
@@ -214,6 +228,9 @@ def balanced_load(
         for keys in must_allocate_keys:
             device_map[keys] = temp_max_idx
             del params_ratio[keys]
+        layers_per_device[temp_max_idx] -= must_allocate_burden
+            
+
         # 开始分配特殊层
         for layer_name, layer_burden in params_ratio.items():
 
@@ -226,6 +243,7 @@ def balanced_load(
             device_map[layer_name] = devices_idx[current_device]
             layers_per_device[current_device] -= layer_burden
 
+ 
         # 先分配普通层，因为他们数量很多，保证他们尽可能在一个device上会加快推理速度
         for layer_name, layer_burden in layers.items():
             current_device = 0
