@@ -1,6 +1,6 @@
 Metadata-Version: 2.1
 Name: niuload
-Version: 0.1.5
+Version: 0.1.7
 Summary: A module for balanced loading of large language models
 Home-page: https://github.com/rangehow/niuload
 Author: rangehow

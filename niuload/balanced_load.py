@@ -1,6 +1,6 @@
 import accelerate
 import torch
-from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM
+from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoModel
 import math
 from torch.cuda import device_count
 
@@ -8,20 +8,46 @@ from torch.cuda import device_count
 model_type2lm_head_modules = {
     "fsmt": lambda model: model.model.decoder.output_projection,
     "llama": lambda model: model.lm_head,
-    "gemma":lambda model: model.lm_head,
-    "qwen2":lambda model: model.lm_head,
-    "mistral":lambda model: model.lm_head,
+    "gemma": lambda model: model.lm_head,
+    "qwen2": lambda model: model.lm_head,
+    "mistral": lambda model: model.lm_head,
+    "bart": lambda model: model.lm_head,
 }
 
 model_type2lm_head_names = {
     "fsmt": "model.decoder.output_projection",
     "llama": "lm_head",
-    "gemma":"lm_head",
-    "qwen2":"lm_head",
-    "mistral":"lm_head",
+    "gemma": "lm_head",
+    "qwen2": "lm_head",
+    "mistral": "lm_head",
+    "bart": "lm_head",
 }
 
-# layers_must_be_placed_together=[(*.embed_positions)]
+def balanced_partition(items, k):
+    """
+    使用贪心策略将字典 items 的 item 尽可能均分成 k 份
+    :param items: dict，key 为 item 名称，value 为 item 对应的值
+    :param k: int，目标分成的份数
+    :return: list，包含 k 个列表，每个列表是一个分配的组，元素是分配的量
+    """
+    # 获取所有 item 的值
+    values = list(items.values())
+    
+    # 目标是分成 k 份
+    groups = [[] for _ in range(k)]
+    group_sums = [0] * k
+    
+    # 按照 item 值大小从大到小排序，尽量先分配较大的数
+    sorted_values = sorted(values, reverse=True)
+    
+    for value in sorted_values:
+        # 找到当前总和最小的组，将当前 value 分配到该组
+        min_group_index = group_sums.index(min(group_sums))
+        groups[min_group_index].append(value)
+        group_sums[min_group_index] += value
+    
+    return group_sums[::-1]
+
 
 
 def balanced_load(
@@ -31,6 +57,7 @@ def balanced_load(
     ratio=None,
     devices_idx=None,
     encoder_decoder=False,
+    encoder_only=False,
 ):
     """_summary_
 
@@ -45,6 +72,7 @@ def balanced_load(
     Returns:
         _type_: _description_
     """
+
     if ratio is not None:
         assert len(ratio) == num_devices, "len(ratio) should equal to num_devices"
         if sum(ratio) != 1:
@@ -62,13 +90,21 @@ def balanced_load(
                 torch_dtype="auto",
                 trust_remote_code=True,
             )
+        elif encoder_only:
+            model = AutoModel.from_pretrained(
+                model_dir,
+                torch_dtype="auto",
+                trust_remote_code=True,
+            )
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_dir,
                 torch_dtype="auto",
                 trust_remote_code=True,
             )
-
+    print(model)
+    
+    # model._no_split_modules  model._tied_weights_keys 不用前者是因为有些模型没有这个属性，不用后者是因为有些模型这个属性只写了个lm head，不如我自己根据config去tie
     devices_idx = list(range(num_devices)) if devices_idx is None else devices_idx
     assert (
         len(devices_idx) == num_devices
@@ -84,17 +120,28 @@ def balanced_load(
     ):
         device_map = {}
 
-        params_cnt = {}  # 用于存放除了layers以外，其他模块的参数量总和？
-        # 计算每个模块的参数量
-        lm_head = model_type2lm_head_modules[model.config.model_type](model)
+        params_cnt = {}  # 用于存放除了layers以外，其他模块的参数量总和
 
-        lm_head_params = sum(p.numel() for p in lm_head.parameters())
-        if not model.config.tie_word_embeddings:
-            if encoder_decoder:
-                lm_head_params *= 3  # ed模型有三个embedding
-            else:
-                lm_head_params *= 2
-        params_cnt[model_type2lm_head_names[model.config.model_type]] = lm_head_params
+        
+        
+        # 计算每个模块的参数量
+        if not encoder_only:
+            lm_head = model_type2lm_head_modules[model.config.model_type](model)
+
+            lm_head_params = sum(p.numel() for p in lm_head.parameters())
+            if not model.config.tie_word_embeddings:
+                if encoder_decoder:
+                    lm_head_params *= 3  # ed模型有三个embedding
+                else:
+                    lm_head_params *= 2
+            params_cnt[model_type2lm_head_names[model.config.model_type]] = (
+                lm_head_params
+            )
+        else:
+            lm_head = model.embeddings
+            lm_head_params = sum(p.numel() for p in lm_head.parameters())
+            params_cnt["embeddings"] = lm_head_params
+
         if encoder_decoder:
             params_cnt["model.encoder.embed_positions"] = sum(
                 p.numel() for p in model.model.encoder.embed_positions.parameters()
@@ -102,16 +149,44 @@ def balanced_load(
             params_cnt["model.decoder.embed_positions"] = sum(
                 p.numel() for p in model.model.encoder.embed_positions.parameters()
             )
-        if hasattr(model.model, "norm"):
-            norm_params = sum(p.numel() for p in model.model.norm.parameters())
-            params_cnt["model.norm"] = norm_params
+            if hasattr(model, "final_logits_bias"):
+                final_logits_bias_params = model.final_logits_bias.numel()
 
-        if hasattr(model.model, "rotary_emb"):
-            rotary_emb_params = sum(
-                p.numel() for p in model.model.rotary_emb.parameters()
-            )
-            params_cnt["model.rotary_emb"] = rotary_emb_params
+                params_cnt["final_logits_bias"] = final_logits_bias_params
 
+        if hasattr(model, "model"):  # encoder only模型我从AutoModel导入，所以少一节。
+            if hasattr(model.model, "norm"):
+                norm_params = sum(p.numel() for p in model.model.norm.parameters())
+                params_cnt["model.norm"] = norm_params
+
+            if hasattr(model.model, "rotary_emb"):
+                rotary_emb_params = sum(
+                    p.numel() for p in model.model.rotary_emb.parameters()
+                )
+                params_cnt["model.rotary_emb"] = rotary_emb_params
+
+            if hasattr(model.model, "shared"):
+                shared_emb_params = sum(
+                    p.numel() for p in model.model.shared.parameters()
+                )
+                params_cnt["model.shared"] = 0
+            if encoder_decoder:
+                if hasattr(model.model.encoder, "layernorm_embedding"):
+                    layernorm_embedding = sum(
+                        p.numel()
+                        for p in model.model.encoder.layernorm_embedding.parameters()
+                    )
+                    params_cnt["model.encoder.layernorm_embedding"] = (
+                        layernorm_embedding
+                    )
+                if hasattr(model.model.decoder, "layernorm_embedding"):
+                    layernorm_embedding = sum(
+                        p.numel()
+                        for p in model.model.decoder.layernorm_embedding.parameters()
+                    )
+                    params_cnt["model.decoder.layernorm_embedding"] = (
+                        layernorm_embedding
+                    )
         if encoder_decoder:
             encoder_layer_params = sum(
                 p.numel() for p in model.model.encoder.layers[0].parameters()
@@ -123,7 +198,8 @@ def balanced_load(
 
             # NOTE 我认为细粒度一点的可能会让层分配的更均匀，因为我下面设的是四舍五入
             layer_params = min(encoder_layer_params, decoder_layer_params)
-
+        elif encoder_only:
+            layer_params = sum(p.numel() for p in model.encoder.layer[0].parameters())
         else:
             layer_params = sum(p.numel() for p in model.model.layers[0].parameters())
 
@@ -133,12 +209,6 @@ def balanced_load(
             key, value = item
             params_ratio[key] = round(value / layer_params)
 
-        # ratio_lm_head = round(lm_head_params / layer_params)
-        # ratio_norm = round(norm_params / layer_params)
-        # ratio_rotary_emb = (
-        #     round(rotary_emb_params / layer_params) if rotary_emb_params > 0 else 0
-        # )
-        
         total_layers = 0
         if encoder_decoder:
             if encoder_layer_params < decoder_layer_params:
@@ -154,19 +224,11 @@ def balanced_load(
                     * model.config.encoder_layers
                 )
 
-        else:
+        else:  # both encoder/decoder only
             total_layers += model.config.num_hidden_layers
 
         total_layers += sum(d for d in params_ratio.values())
 
-        # total_layers +=
-        # num_layers = (
-        #     model.config.encoder_layers + model.config.decoder_layers
-
-        #     else model.config.num_hidden_layers
-        # )
-
-        # 确定每个设备应该分配到的层数
         if ratio is not None:
             layers_per_device = [round(r * total_layers) for r in ratio]
         else:
@@ -177,63 +239,78 @@ def balanced_load(
         remainder = total_layers - sum(layers_per_device)
 
         # 从后面开始分配剩余层
-        start_index=num_devices-1
-        while remainder!=0:
-            layers_per_device[start_index]+=1
-            remainder-=1
-            start_index=start_index-1%num_devices
+        start_index = num_devices - 1
+        while remainder != 0:
+            layers_per_device[start_index] += 1
+            remainder -= 1
+            start_index = start_index - 1 % num_devices
         for i in range(remainder - 1, -1, -1):
             layers_per_device[i] += 1
 
-        print(layers_per_device)
-
+        
+        
         layers = {}
         if encoder_decoder:
 
             for i in range(model.config.encoder_layers):
-                layers[f"model.encoder.layers.{i}"] = (
+                params_ratio[f"model.encoder.layers.{i}"] = (
                     1
                     if encoder_layer_params <= decoder_layer_params
                     else round(encoder_layer_params / decoder_layer_params)
                 )
 
             for i in range(model.config.encoder_layers):
-                layers[f"model.decoder.layers.{i}"] = (
+                params_ratio[f"model.decoder.layers.{i}"] = (
                     1
                     if encoder_layer_params >= decoder_layer_params
                     else round(decoder_layer_params / encoder_layer_params)
                 )
-
-        else:
+        elif encoder_only:
             for i in range(model.config.num_hidden_layers):
-                layers[f"model.layers.{i}"] = 1
+                params_ratio[f"encoder.layer.{i}"] = 1
+        else:
 
+            for i in range(model.config.num_hidden_layers):
+                params_ratio[f"model.layers.{i}"] = 1
 
         
-        # 位置编码和输入层必须放在一起，不然会马上报错
+        
+        # encoder only模型把word embedding和position embedding、type embedding打包在一起了
+        # 位置编码和输入层必须放在一起，不然会马上报错.
         must_allocate_burden = 0
         must_allocate_keys = []
         for layer_name, layer_burden in params_ratio.items():
-            if "emb" in layer_name:
+            if "emb" in layer_name or "shared" in layer_name:
                 must_allocate_burden += layer_burden
                 must_allocate_keys.append(layer_name)
-        must_allocate_keys.append(model_type2lm_head_names[model.config.model_type])
-        must_allocate_burden += params_ratio[
-            model_type2lm_head_names[model.config.model_type]
-        ]
-        temp_max_burden = 0
-        temp_max_idx = len(layers_per_device) - 1
-        for idx, burden in enumerate(layers_per_device):
-            if temp_max_burden <= burden:  # 等于可以尽可能分配到后面去
-                temp_max_burden = burden
-                temp_max_idx = idx
+
+        # 上面的代码用来处理纯粹的位置编码，然后下面这里用来处理lm head
+        if not encoder_only:
+            must_allocate_keys.append(model_type2lm_head_names[model.config.model_type])
+            must_allocate_burden += params_ratio[
+                model_type2lm_head_names[model.config.model_type]
+            ]
+        # temp_max_burden = 0
+        # temp_max_idx = len(layers_per_device) - 1
+        # for idx, burden in enumerate(layers_per_device):
+        #     if temp_max_burden <= burden:  # 等于可以尽可能分配到后面去
+        #         temp_max_burden = burden
+        #         temp_max_idx = idx
+
         for keys in must_allocate_keys:
-            device_map[keys] = devices_idx[temp_max_idx]
+            # device_map[keys] = devices_idx[temp_max_idx]
+
             del params_ratio[keys]
-        layers_per_device[temp_max_idx] -= must_allocate_burden
+
+        params_ratio["must_together"]=must_allocate_burden
         
-        # import pdb
-        # pdb.set_trace()
+        layers_per_device=balanced_partition(params_ratio,num_devices)
+        print(layers_per_device)
+
+
+        # BUG 下面的两种分配过程存在一种corner case，就是任何一层都放不下了，会导致current device找不到合法值越界。
+        # 但这个现象非常难以出现。因为大模型里最大的层通常就是embedding层。而embedding层在上面已经被我们分配完了。
+        # 目前看最大的可能是encoder layer和decoder layer差距很多容易导致这个。
 
         # 开始分配特殊层
         for layer_name, layer_burden in params_ratio.items():
@@ -244,23 +321,28 @@ def balanced_load(
                 and layers_per_device[current_device] - layer_burden < 0
             ):
                 current_device += 1
+
             device_map[layer_name] = devices_idx[current_device]
             layers_per_device[current_device] -= layer_burden
 
-        # import pdb
-        # pdb.set_trace()
+        
 
- 
         # 先分配普通层，因为他们数量很多，保证他们尽可能在一个device上会加快推理速度
-        for layer_name, layer_burden in layers.items():
-            current_device = 0
-            while (
-                current_device < num_devices
-                and layers_per_device[current_device] - layer_burden < 0
-            ):
-                current_device += 1
-            device_map[layer_name] = devices_idx[current_device]
-            layers_per_device[current_device] -= layer_burden
+        # for layer_name, layer_burden in layers.items():
+        #     current_device = 0
+        #     while (
+        #         current_device < num_devices
+        #         and layers_per_device[current_device] - layer_burden < 0
+        #     ):
+        #         current_device += 1
+        #     device_map[layer_name] = devices_idx[current_device]
+        #     layers_per_device[current_device] -= layer_burden
+
+        for keys in must_allocate_keys:
+            device_map[keys]=device_map["must_together"]
+        
+        del device_map["must_together"]
+    
         if encoder_decoder:
             # 考虑到tied weights，他们需要在一起，而且我已经把他们的重量认定给lm_head了
             device_map["model.encoder.embed_tokens"] = device_map[
@@ -269,15 +351,14 @@ def balanced_load(
             device_map["model.decoder.embed_tokens"] = device_map[
                 model_type2lm_head_names[model.config.model_type]
             ]
+        elif encoder_only:
+            pass
         else:
             device_map["model.embed_tokens"] = device_map[
                 model_type2lm_head_names[model.config.model_type]
             ]
 
-        # import pdb
-        # pdb.set_trace()
 
-        
         return device_map
 
     # 使用手动创建的 device_map
@@ -300,6 +381,14 @@ def balanced_load(
     del model
     if encoder_decoder:
         model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_dir,
+            torch_dtype=torch.float32,
+            device_map=device_map,
+            low_cpu_mem_usage="True",
+            trust_remote_code=True,
+        )
+    elif encoder_only:
+        model = AutoModel.from_pretrained(
             model_dir,
             torch_dtype=torch.float32,
             device_map=device_map,
@@ -335,3 +424,12 @@ def balanced_load(
 
     # print_module_devices(model)
     return model
+
+
+
+if __name__=="__main__":
+    # model=balanced_load("/mnt/rangehow/models/gte-multilingual-base",encoder_only=True)
+    model=balanced_load("/mnt/rangehow/models/gemma-2b")
+    print(model(torch.tensor([[1,2,3]],device=model.device)))
+    
+    # balanced_load("/mnt/rangehow/models/Meta-Llama-3.1-8B-Instruct")
