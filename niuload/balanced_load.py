@@ -293,8 +293,25 @@ def balanced_load(
 
         params_ratio["must_together"]=must_allocate_burden
         
+        ## 层预算确定
+        # 强行把embed这些丢0号卡，现在hf有bug，不能自由选择
+        device_map["must_together"]=devices_idx[0]
+        for keys in must_allocate_keys:
+            device_map[keys]=device_map["must_together"]
         
+        # 看一下0号卡还能不能分配的了
+        if ratio is not None:
+            
+            if ratio[0]>params_ratio["must_together"]/total_layers:
+                ratio[0]-=params_ratio["must_together"]/total_layers
+            else:
+                print(f"必须分配在0号卡上的单元占比超出了预期的{params_ratio["must_together"]/total_layers-ratio[0]}")
+                ratio[0]=0
+  
+        total_layers-=params_ratio["must_together"]
+        del params_ratio["must_together"]    
         
+
         max_module_size= max(list(params_ratio.values()))
         layers_per_device = [
                 total_layers // num_devices for _ in range(num_devices)
@@ -305,10 +322,12 @@ def balanced_load(
         remainder = total_layers - sum(layers_per_device)
         
         # 由于采用整除，因此remainder不可能大于num_devices，因此一次循环必定完成。
-        for i in range(remainder - 1, -1, -1):
-            layers_per_device[i] += 1
-
-        
+        i=num_devices-1
+        while remainder>=0:
+            if layers_per_device[i]!=0: # 本身是0的就不要再分配了，因为已经超出预计比例了
+                layers_per_device[i] += 1
+            remainder-=1
+            i=(i-1)%num_devices
         
 
         # 多个相同最大值取出最后一个index的
@@ -374,10 +393,9 @@ def balanced_load(
         #     device_map[layer_name] = devices_idx[current_device]
         #     layers_per_device[current_device] -= layer_burden
 
-        for keys in must_allocate_keys:
-            device_map[keys]=device_map["must_together"]
         
-        del device_map["must_together"]
+        
+        
     
         if encoder_decoder:
             # 考虑到tied weights，他们需要在一起，而且我已经把他们的重量认定给lm_head了
@@ -464,9 +482,16 @@ def balanced_load(
 
 
 if __name__=="__main__":
-    model=balanced_load("/mnt/rangehow/models/gte-multilingual-base",encoder_only=True,ratio=[0.6,1,1,1,1,1,1,1])
+    # model=balanced_load("/mnt/rangehow/models/gte-multilingual-base",encoder_only=True,ratio=[0.6,1,1,1,1,1,1,1])
     # model=balanced_load("/mnt/rangehow/models/gemma-2b")
     # print(model(torch.tensor([[1,2,3]],device=model.device)))
     
-    model=balanced_load("/mnt/rangehow/models/Meta-Llama-3.1-8B-Instruct",ratio=[0.6,1,1,1],num_devices=4)
-    print(model(torch.tensor([[1,2,3]],device=model.device)))
+    model=balanced_load("/mnt/rangehow/models/Qwen2.5-7B-Instruct",ratio=[0.5,1,1,1],num_devices=4)
+    from transformers import AutoTokenizer
+    tokenizer=AutoTokenizer.from_pretrained("/mnt/rangehow/models/Qwen2.5-7B-Instruct")
+    inputs=tokenizer("I don't wanna like !",return_tensors="pt")
+
+    model(
+        input_ids=inputs.input_ids.to(model.device),
+        attention_mask=inputs.attention_mask.to(model.device),
+        )
