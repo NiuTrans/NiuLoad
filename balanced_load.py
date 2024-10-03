@@ -3,7 +3,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoModel
 import math
 from torch.cuda import device_count
-
+from transformers.utils import ContextManagers
+from accelerate import init_empty_weights,dispatch_model
 
 model_type2lm_head_modules = {
     "fsmt": lambda model: model.model.decoder.output_projection,
@@ -12,12 +13,14 @@ model_type2lm_head_modules = {
     "qwen2": lambda model: model.lm_head,
     "mistral": lambda model: model.lm_head,
     "bart": lambda model: model.lm_head,
+    "gemma2":lambda model:model.lm_head,
 }
 
 model_type2lm_head_names = {
     "fsmt": "model.decoder.output_projection",
     "llama": "lm_head",
     "gemma": "lm_head",
+    "gemma2": "lm_head",
     "qwen2": "lm_head",
     "mistral": "lm_head",
     "bart": "lm_head",
@@ -58,6 +61,7 @@ def balanced_load(
     devices_idx=None,
     encoder_decoder=False,
     encoder_only=False,
+    show_hf_device=True,
 ):
     """_summary_
 
@@ -77,12 +81,14 @@ def balanced_load(
         assert len(ratio) == num_devices, "len(ratio) should equal to num_devices"
         if sum(ratio) != 1:
             ratio = [d / sum(ratio) for d in ratio]
-
+    else:
+        ratio = [1/num_devices for _ in range(num_devices)]
     from collections import OrderedDict
     import math
     from transformers import AutoModelForCausalLM
     import accelerate
 
+    
     with accelerate.init_empty_weights():
         if encoder_decoder:
             model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -102,7 +108,7 @@ def balanced_load(
                 torch_dtype="auto",
                 trust_remote_code=True,
             )
-    print(model)
+    # print(model)
     
     # model._no_split_modules  model._tied_weights_keys 不用前者是因为有些模型没有这个属性，不用后者是因为有些模型这个属性只写了个lm head，不如我自己根据config去tie
     devices_idx = list(range(num_devices)) if devices_idx is None else devices_idx
@@ -295,21 +301,24 @@ def balanced_load(
         
         ## 层预算确定
         # 强行把embed这些丢0号卡，现在hf有bug，不能自由选择
-        device_map["must_together"]=devices_idx[0]
+        must_together_device=-1
+        device_map["must_together"]=devices_idx[must_together_device]
         for keys in must_allocate_keys:
             device_map[keys]=device_map["must_together"]
         
         # 看一下0号卡还能不能分配的了
         if ratio is not None:
             
-            if ratio[0]>params_ratio["must_together"]/total_layers:
-                ratio[0]-=params_ratio["must_together"]/total_layers
+            if ratio[must_together_device]>params_ratio["must_together"]/total_layers:
+                ratio[must_together_device]-=params_ratio["must_together"]/total_layers
             else:
-                print(f"必须分配在0号卡上的单元占比超出了预期的{params_ratio["must_together"]/total_layers-ratio[0]}")
-                ratio[0]=0
-  
+                print(f"必须分配在{must_together_device}号卡上的单元占比超出了预期的{params_ratio["must_together"]/total_layers-ratio[0]}")
+                ratio[must_together_device]=0
+
+
         total_layers-=params_ratio["must_together"]
-        del params_ratio["must_together"]    
+        del params_ratio["must_together"] 
+        del device_map["must_together"]
         
 
         max_module_size= max(list(params_ratio.values()))
@@ -349,15 +358,21 @@ def balanced_load(
             # 如果没有找到比最大值小的次大值，退出循环（避免死循环）
             if second_largest_index == -1:
                 break
-
+            
+            
+            
+            
+            
             # 从次大位置取出1，给最大位置
             layers_per_device[second_largest_index] -= 1
             layers_per_device[max_value_index] += 1
 
             # 重新计算最大值的差距
             diff = max_module_size - layers_per_device[max_value_index]
-               
+        
+
         print("burden per device",layers_per_device)
+        
         # BUG 下面的两种分配过程存在一种corner case，就是任何一层都放不下了，会导致current device找不到合法值越界。
         # 但这个现象非常难以出现。因为大模型里最大的层通常就是embedding层。而embedding层在上面已经被我们分配完了。
         # 目前看最大的可能是encoder layer和decoder layer差距很多容易导致这个。
@@ -412,26 +427,29 @@ def balanced_load(
                 model_type2lm_head_names[model.config.model_type]
             ]
 
-
+        print(device_map)
         return device_map
 
     # 使用手动创建的 device_map
     device_map = create_manual_device_map(model, num_devices, is_distillation)
 
-    # 打印 device_map 结果
-    # 打印 device_map 结果和每个设备上的元素统计
-    device_stats = {}
-    for module, device in device_map.items():
-        if device not in device_stats:
-            device_stats[device] = {"count": 0, "modules": []}
-        device_stats[device]["count"] += 1
-        device_stats[device]["modules"].append(module)
+    
+    if show_hf_device:
+        # 打印 device_map 结果
+        # 打印 device_map 结果和每个设备上的元素统计
+        device_stats = {}
+        for module, device in device_map.items():
+            if device not in device_stats:
+                device_stats[device] = {"count": 0, "modules": []}
+            device_stats[device]["count"] += 1
+            device_stats[device]["modules"].append(module)
 
-    print("Device Map:")
-    for device, stats in device_stats.items():
-        print(f"Device {device}: {stats['count']} elements")
-        print(f"  Modules: {', '.join(stats['modules'])}")
+        print("Device Map:")
+        for device, stats in device_stats.items():
+            print(f"Device {device}: {stats['count']} elements")
+            print(f"  Modules: {', '.join(stats['modules'])}")
 
+    
     del model
     if encoder_decoder:
         model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -455,11 +473,6 @@ def balanced_load(
             torch_dtype="auto",
             device_map=device_map,
             low_cpu_mem_usage="True",
-            attn_implementation=(
-                "eager"
-                if "gemma" in model_dir.lower() or "phi" in model_dir.lower()
-                else "sdpa"
-            ),
             trust_remote_code=True,
         )
 
@@ -490,7 +503,9 @@ if __name__=="__main__":
     from transformers import AutoTokenizer
     tokenizer=AutoTokenizer.from_pretrained("/mnt/rangehow/models/Qwen2.5-7B-Instruct")
     inputs=tokenizer("I don't wanna like !",return_tensors="pt")
-
+    import pdb
+    pdb.set_trace()
+    str=" ".join(tokenizer.tokenize("东北大学自然语言处理实验室太无敌了啊！"))
     model(
         input_ids=inputs.input_ids.to(model.device),
         attention_mask=inputs.attention_mask.to(model.device),
