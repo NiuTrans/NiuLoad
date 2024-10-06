@@ -9,10 +9,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 tested_models = [
-    "/mnt/rangehow/models/Qwen2.5-7B-Instruct",
-    "/mnt/rangehow/models/gemma-2-9b-it",
-    "/mnt/rangehow/models/Meta-Llama-3.1-8B-Instruct",
-    "/mnt/rangehow/models/gemma-2b"
+    "Qwen/Qwen2.5-7B-Instruct",
+    "google/gemma-2-9b-it",
+    "meta-llama/Llama-3.1-8B-Instruct",
+    "google/gemma-2b"
 ]
 
 def load_method1(model_name):

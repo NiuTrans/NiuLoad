@@ -26,53 +26,28 @@ model_type2lm_head_names = {
     "bart": "lm_head",
 }
 
-def balanced_partition(items, k):
-    """
-    使用贪心策略将字典 items 的 item 尽可能均分成 k 份
-    :param items: dict，key 为 item 名称，value 为 item 对应的值
-    :param k: int，目标分成的份数
-    :return: list，包含 k 个列表，每个列表是一个分配的组，元素是分配的量
-    """
-    # 获取所有 item 的值
-    values = list(items.values())
-    
-    # 目标是分成 k 份
-    groups = [[] for _ in range(k)]
-    group_sums = [0] * k
-    
-    # 按照 item 值大小从大到小排序，尽量先分配较大的数
-    sorted_values = sorted(values, reverse=True)
-    
-    for value in sorted_values:
-        # 找到当前总和最小的组，将当前 value 分配到该组
-        min_group_index = group_sums.index(min(group_sums))
-        groups[min_group_index].append(value)
-        group_sums[min_group_index] += value
-    
-    return group_sums[::-1]
 
 
 
 def balanced_load(
     model_dir,
     num_devices=device_count(),
-    is_distillation=False,
     ratio=None,
     devices_idx=None,
     encoder_decoder=False,
     encoder_only=False,
-    show_hf_device=True,
+    show_hf_device=False,
+    return_device_map_only=False,
 ):
     """_summary_
 
     Args:
         model_dir (str): can be local path or hf identifier.
         num_devices (int, optional): the num of devices you want to use for loading model . Defaults to all cuda device.
-        is_distillation (bool, optional): _description_. Defaults to False.
         ratio (list[float], optional): each device load how much of the model, like [0.8,1] means the ratio between two device.
         devices_idx (list[int], optional): _description_. the device you want to use, like [2,4] means "cuda:2" and "cuda:4".
         encoder_decoder (bool, optional): the model you want to load is encoder-decoder model or not? . Defaults to False.
-
+        return_device_map_only (bool, optional): If you only want to get the allocated device map, set this to True.
     Returns:
         _type_: _description_
     """
@@ -119,7 +94,6 @@ def balanced_load(
     def create_manual_device_map(
         model,
         num_devices,
-        is_distillation=False,
         ratio=ratio,
         devices_idx=devices_idx,
         encoder_decoder=encoder_decoder,
@@ -301,7 +275,7 @@ def balanced_load(
         
         ## 层预算确定
         # 强行把embed这些丢0号卡，现在hf有bug，不能自由选择
-        must_together_device=-1
+        must_together_device=0
         device_map["must_together"]=devices_idx[must_together_device]
         for keys in must_allocate_keys:
             device_map[keys]=device_map["must_together"]
@@ -370,8 +344,8 @@ def balanced_load(
             # 重新计算最大值的差距
             diff = max_module_size - layers_per_device[max_value_index]
         
-
-        print("burden per device",layers_per_device)
+        if show_hf_device:
+            print("burden per device",layers_per_device)
         
         # BUG 下面的两种分配过程存在一种corner case，就是任何一层都放不下了，会导致current device找不到合法值越界。
         # 但这个现象非常难以出现。因为大模型里最大的层通常就是embedding层。而embedding层在上面已经被我们分配完了。
@@ -427,12 +401,15 @@ def balanced_load(
                 model_type2lm_head_names[model.config.model_type]
             ]
 
-        print(device_map)
+        if show_hf_device:
+            print(device_map)
         return device_map
 
     # 使用手动创建的 device_map
-    device_map = create_manual_device_map(model, num_devices, is_distillation)
+    device_map = create_manual_device_map(model, num_devices)
 
+    if return_device_map_only:
+        return device_map
     
     if show_hf_device:
         # 打印 device_map 结果
