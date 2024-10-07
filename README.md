@@ -1,15 +1,13 @@
-# niuload
+# NiuLoad
 
 niuload is a Python module for balanced loading large language models across multiple GPUs(pipeline parallel).
 This package can be used during training and inference.
 
-## report
+## Report (Chinese)
 More details can be found at:
 https://zhuanlan.zhihu.com/p/792303768 
 
-
-
-## Usages
+## Usage
 
 niuload offers the following advanced features:
 
