@@ -6,17 +6,21 @@ from torch.cuda import device_count
 from transformers.utils import ContextManagers
 from accelerate import init_empty_weights,dispatch_model
 
-model_type2lm_head_modules = {
+from collections import defaultdict
+
+default_lm_head_module = lambda model: model.lm_head
+model_type2lm_head_modules = defaultdict(lambda: default_lm_head_module, {
     "fsmt": lambda model: model.model.decoder.output_projection,
     "llama": lambda model: model.lm_head,
     "gemma": lambda model: model.lm_head,
     "qwen2": lambda model: model.lm_head,
     "mistral": lambda model: model.lm_head,
     "bart": lambda model: model.lm_head,
-    "gemma2":lambda model:model.lm_head,
-}
+    "gemma2": lambda model: model.lm_head,
+})
 
-model_type2lm_head_names = {
+
+model_type2lm_head_names = defaultdict(lambda: "lm_head", {
     "fsmt": "model.decoder.output_projection",
     "llama": "lm_head",
     "gemma": "lm_head",
@@ -24,8 +28,7 @@ model_type2lm_head_names = {
     "qwen2": "lm_head",
     "mistral": "lm_head",
     "bart": "lm_head",
-}
-
+})
 
 
 
