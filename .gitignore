@@ -2,4 +2,4 @@ build/
 dist/
 1.py
 2.py
-niuload.egg-info/
+*.egg-info/
