@@ -289,7 +289,7 @@ def balanced_load(
             if ratio[must_together_device]>params_ratio["must_together"]/total_layers:
                 ratio[must_together_device]-=params_ratio["must_together"]/total_layers
             else:
-                print(f"必须分配在{must_together_device}号卡上的单元占比超出了预期的{params_ratio["must_together"]/total_layers-ratio[0]}")
+                # print(f"必须分配在{must_together_device}号卡上的单元占比超出了预期的{params_ratio["must_together"]/total_layers-ratio[0]}")
                 ratio[must_together_device]=0
 
 
@@ -479,12 +479,13 @@ if __name__=="__main__":
     # model=balanced_load("/mnt/rangehow/models/gemma-2b")
     # print(model(torch.tensor([[1,2,3]],device=model.device)))
     
-    model=balanced_load("/mnt/rangehow/models/Qwen2.5-7B-Instruct",ratio=[0.5,1,1,1],num_devices=4)
+    model=balanced_load("/mnt/rangehow/models/gemma-2b",ratio=[0.1,1,1,1,1,1],num_devices=6,show_hf_device=True)
+    import pdb
+    pdb.set_trace()
     from transformers import AutoTokenizer
     tokenizer=AutoTokenizer.from_pretrained("/mnt/rangehow/models/Qwen2.5-7B-Instruct")
     inputs=tokenizer("I don't wanna like !",return_tensors="pt")
-    import pdb
-    pdb.set_trace()
+    
     str=" ".join(tokenizer.tokenize("东北大学自然语言处理实验室太无敌了啊！"))
     model(
         input_ids=inputs.input_ids.to(model.device),
